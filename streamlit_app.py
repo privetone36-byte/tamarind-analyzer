@@ -1,12 +1,12 @@
 import streamlit as st
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 import cv2
 import pandas as pd
 
 # ==================== PAGE CONFIG ====================
 st.set_page_config(
-    page_title="วิเคราะห์มะขาม - Multi Detector",
+    page_title="วิเคราะห์มะขาม - Multi Detector v2",
     page_icon="🌿",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -123,128 +123,225 @@ def calculate_grade(type_info, size, color, clean, moisture, pulp, taste, shape)
     )
     return total, {"size": sSc, "color": cSc, "clean": clSc, "moisture": mSc, "pulp": pSc, "taste": tSc, "shape": shSc}
 
-# ==================== MULTI-DETECT ENGINE ====================
-def detect_tamarinds_in_image(img_array, min_area=500, max_area=50000):
+# ==================== ADVANCED DETECTION ENGINE v2 ====================
+def detect_tamarinds_advanced(img_array, params):
     """
-    ตรวจจับมะขามหลายลูกในภาพเดียวด้วย OpenCV
-    ใช้ Color Masking (HSV) + Contour Detection
+    ตรวจจับมะขามแต่ละผลด้วย HSV + Morphology + minAreaRect + Multi-criteria Filtering
+    params: dict ของพารามิเตอร์ที่ปรับได้
     """
-    img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+    img_rgb = img_array.copy()
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    h, w = img_rgb.shape[:2]
+
+    h_low = params.get("hsv_h_low", 0)
+    h_high = params.get("hsv_h_high", 40)
+    s_low = params.get("hsv_s_low", 8)
+    s_high = params.get("hsv_s_high", 255)
+    v_low = params.get("hsv_v_low", 10)
+    v_high = params.get("hsv_v_high", 250)
+    morph_close = params.get("morph_close", 20)
+    min_area = params.get("min_area", 300)
+    max_area = params.get("max_area", 50000)
+    min_ar = params.get("min_aspect", 0.8)
+    max_ar = params.get("max_aspect", 20.0)
+    min_sol = params.get("min_solidity", 0.25)
+    min_ext = params.get("min_extent", 0.15)
+
+    # ========== STEP 1: HSV Color Masking ==========
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-    # สร้าง Mask สำหรับสีน้ำตาล/เหลือง/แดงของมะขาม
-    # Range 1: สีน้ำตาลแดง (ripe tamarind)
-    lower1 = np.array([0, 40, 20])
-    upper1 = np.array([30, 255, 200])
-    mask1 = cv2.inRange(hsv, lower1, upper1)
+    lower = np.array([h_low, s_low, v_low])
+    upper = np.array([h_high, s_high, v_high])
+    color_mask = cv2.inRange(hsv, lower, upper)
 
-    # Range 2: สีเหลืองอมน้ำตาล
-    lower2 = np.array([10, 30, 30])
-    upper2 = np.array([40, 255, 220])
-    mask2 = cv2.inRange(hsv, lower2, upper2)
+    # กรองสีเขียว (ใบไม้)
+    green_mask = cv2.inRange(hsv, np.array([35, 20, 20]), np.array([90, 255, 255]))
+    color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(green_mask))
 
-    # รวม Mask
-    mask = cv2.bitwise_or(mask1, mask2)
+    # กรองสีน้ำเงิน/ม่วง
+    blue_mask = cv2.inRange(hsv, np.array([90, 20, 20]), np.array([140, 255, 255]))
+    color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(blue_mask))
 
-    # Morphological operations ลบ noise
-    kernel = np.ones((5,5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    # กรองขาว/ดำสนิท
+    white_mask = cv2.inRange(hsv, np.array([0, 0, 200]), np.array([180, 30, 255]))
+    black_mask = cv2.inRange(hsv, np.array([0, 0, 0]), np.array([180, 255, 20]))
+    color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(white_mask))
+    color_mask = cv2.bitwise_and(color_mask, cv2.bitwise_not(black_mask))
 
-    # หา Contours
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # ========== STEP 2: Morphological Operations ==========
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph_close, morph_close))
+
+    mask_clean = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel_open)
+    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel_close)
+
+    # ========== STEP 3: Find Contours ==========
+    contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     detected_objects = []
-    h_img, w_img = img_array.shape[:2]
+    rejected_log = []
 
     for i, cnt in enumerate(contours):
         area = cv2.contourArea(cnt)
         if area < min_area or area > max_area:
+            if area > 0:
+                rejected_log.append(f"#{i} area={area:.0f}")
             continue
 
-        x, y, w, h = cv2.boundingRect(cnt)
-        # ป้องกัน out of bounds
-        x = max(0, x)
-        y = max(0, y)
-        w = min(w, w_img - x)
-        h = min(h, h_img - y)
+        # ใช้ minAreaRect แทน boundingRect เพื่อรองรับการเอียง
+        rect = cv2.minAreaRect(cnt)
+        box = cv2.boxPoints(rect)
+        box = np.int32(box)  # แก้ไขจาก np.int0
 
-        # Crop ROI
-        roi = img_array[y:y+h, x:x+w]
+        # คำนวณขนาดจาก minAreaRect
+        (cx, cy), (rw, rh), angle = rect
+        rw, rh = max(rw, 1), max(rh, 1)
+        aspect = max(rw, rh) / min(rw, rh)
+
+        # Bounding box สำหรับ crop ROI
+        x, y, bw, bh = cv2.boundingRect(cnt)
+
+        # Convex hull
+        hull = cv2.convexHull(cnt)
+        hull_area = cv2.contourArea(hull)
+        solidity = float(area) / hull_area if hull_area > 0 else 0
+
+        # Extent (ใช้ minAreaRect area แทน)
+        rect_area = rw * rh
+        extent = float(area) / rect_area if rect_area > 0 else 0
+
+        # Shape filtering
+        if aspect < min_ar:
+            rejected_log.append(f"#{i} AR={aspect:.2f} < {min_ar}")
+            continue
+        if aspect > max_ar:
+            rejected_log.append(f"#{i} AR={aspect:.2f} > {max_ar}")
+            continue
+        if solidity < min_sol:
+            rejected_log.append(f"#{i} solidity={solidity:.2f} < {min_sol}")
+            continue
+        if extent < min_ext:
+            rejected_log.append(f"#{i} extent={extent:.2f} < {min_ext}")
+            continue
+
+        # Position filtering (ignore edges)
+        center_y = y + bh / 2
+        if center_y < h * 0.05 or center_y > h * 0.95:
+            rejected_log.append(f"#{i} at edge y={center_y:.0f}")
+            continue
+
+        # Color validation
+        margin = 3
+        x1, y1 = max(0, x-margin), max(0, y-margin)
+        x2, y2 = min(w, x+bw+margin), min(h, y+bh+margin)
+        roi = img_rgb[y1:y2, x1:x2]
         if roi.size == 0:
             continue
 
-        # วิเคราะห์สี ROI
-        roi_rgb = roi.astype(float) / 255.0
-        r, g, b = roi_rgb[:,:,0], roi_rgb[:,:,1], roi_rgb[:,:,2]
-        max_c = np.maximum(np.maximum(r, g), b)
-        min_c = np.minimum(np.minimum(r, g), b)
-        delta = max_c - min_c
-        v = max_c
-        s = np.where(max_c == 0, 0, delta / max_c)
+        roi_hsv = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+        mean_h = np.mean(roi_hsv[:,:,0])
+        mean_s = np.mean(roi_hsv[:,:,1])
+        mean_v = np.mean(roi_hsv[:,:,2])
 
-        avg_bri = float(np.mean(v) * 100)
-        warm = np.sum(((delta != 0) & (((np.arctan2(np.sqrt(3)*(g-b), 2*r-g-b) * 180/np.pi + 360) % 360) >= 15) & 
-                       (((np.arctan2(np.sqrt(3)*(g-b), 2*r-g-b) * 180/np.pi + 360) % 360) <= 45)))
-        total_px = roi_rgb.shape[0] * roi_rgb.shape[1]
-        wR = float(warm / total_px) if total_px > 0 else 0
+        # Reject non-tamarind colors
+        if 40 < mean_h < 85 and mean_s > 20:
+            rejected_log.append(f"#{i} green h={mean_h:.1f}")
+            continue
+        if 85 <= mean_h <= 140 and mean_s > 25:
+            rejected_log.append(f"#{i} blue h={mean_h:.1f}")
+            continue
+        if mean_s < 5 and mean_v > 195:
+            rejected_log.append(f"#{i} white")
+            continue
+        if mean_v < 10:
+            rejected_log.append(f"#{i} black")
+            continue
 
-        if wR > 0.4:
-            if avg_bri > 40 and avg_bri < 70:
-                cSc, cLab = 95, "สีสวย"
-            elif avg_bri >= 30 and avg_bri <= 80:
-                cSc, cLab = 80, "สีดี"
-            else:
-                cSc, cLab = 65, "สีพอใช้"
-        elif wR > 0.2:
-            cSc, cLab = 60, "สีไม่สม่ำเสมอ"
+        # Color scoring
+        if (0 <= mean_h <= 35 or mean_h >= 160) and mean_s > 15 and 20 <= mean_v <= 230:
+            cSc, cLab = 95, "สีสวย"
+        elif mean_s > 8 and 15 <= mean_v <= 240:
+            cSc, cLab = 80, "สีดี"
         else:
-            cSc, cLab = 35, "สีไม่ดี"
+            cSc, cLab = 60, "สีพอใช้"
 
-        # ประมาณขนาดจาก pixel area (สมมติ 1cm = 50 pixels)
-        px_per_cm = 50
+        # Size estimation
+        px_per_cm = 45
         est_size = np.sqrt(area) / px_per_cm
 
         detected_objects.append({
-            "id": i + 1,
-            "x": x, "y": y, "w": w, "h": h,
+            "id": 0,
+            "x": x, "y": y, "w": bw, "h": bh,
             "area": int(area),
             "estimated_size": round(est_size, 1),
             "color_score": int(cSc),
             "color_label": cLab,
-            "avg_brightness": round(avg_bri, 1),
-            "roi": roi
+            "avg_brightness": round(mean_v / 2.55, 1),
+            "aspect_ratio": round(aspect, 2),
+            "solidity": round(solidity, 2),
+            "extent": round(extent, 2),
+            "angle": round(angle, 1),
+            "roi": roi,
+            "box": box
         })
 
-    # เรียงตามพื้นที่จากมากไปน้อย
     detected_objects.sort(key=lambda x: x["area"], reverse=True)
-    return detected_objects, mask
+    for i, obj in enumerate(detected_objects):
+        obj["id"] = i + 1
 
-def draw_detection_boxes(img_array, objects):
-    """วาดกรอบครอบมะขามแต่ละลูก"""
+    return detected_objects, mask_clean, color_mask, rejected_log
+
+
+def draw_detection_advanced(img_array, objects):
+    """วาดกรอบครอบมะขามแต่ละผลด้วย minAreaRect"""
     img_copy = img_array.copy()
-    colors = [(0, 255, 0), (255, 165, 0), (0, 165, 255), (255, 0, 255), (0, 255, 255)]
+    colors = [
+        (0, 200, 0), (0, 140, 255), (255, 0, 255),
+        (255, 255, 0), (0, 255, 255), (255, 0, 0),
+        (200, 100, 0), (100, 0, 200), (0, 100, 200), (200, 0, 100)
+    ]
 
     for obj in objects:
         color = colors[(obj["id"] - 1) % len(colors)]
-        x, y, w, h = obj["x"], obj["y"], obj["w"], obj["h"]
-        cv2.rectangle(img_copy, (x, y), (x+w, y+h), color, 3)
-        label = f"#{obj['id']} {obj['color_label']}"
-        cv2.putText(img_copy, label, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        # วาด minAreaRect (กรอบเอียง)
+        if "box" in obj:
+            cv2.drawContours(img_copy, [obj["box"]], 0, color, 3)
+        else:
+            x, y, bw, h = obj["x"], obj["y"], obj["w"], obj["h"]
+            cv2.rectangle(img_copy, (x, y), (x+bw, y+h), color, 3)
+
+        # Label
+        x, y = obj["x"], obj["y"]
+        label = f"#{obj['id']} {obj['color_label']} {obj['estimated_size']}cm"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        cv2.rectangle(img_copy, (x, y-th-10), (x+tw+4, y), color, -1)
+        cv2.putText(img_copy, label, (x+2, y-3), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 2)
 
     return img_copy
+
 
 # ==================== SESSION STATE ====================
 if "batch_results" not in st.session_state:
     st.session_state.batch_results = []
 if "detected_objects" not in st.session_state:
     st.session_state.detected_objects = []
+if "detection_params" not in st.session_state:
+    st.session_state.detection_params = {
+        "hsv_h_low": 0, "hsv_h_high": 45,
+        "hsv_s_low": 5, "hsv_s_high": 255,
+        "hsv_v_low": 10, "hsv_v_high": 250,
+        "morph_close": 15,
+        "min_area": 200, "max_area": 40000,
+        "min_aspect": 0.5, "max_aspect": 15.0,
+        "min_solidity": 0.2, "min_extent": 0.1,
+    }
 
 # ==================== UI ====================
-st.markdown("<h1 style='text-align:center;'>🌿 วิเคราะห์มะขาม - หลายลูกในภาพเดียว</h1>", unsafe_allow_html=True)
-st.markdown("<p style='text-align:center;color:#a1887f;'>ถ่ายภาพกองมะขาม → AI แยกลูก → วิเคราะห์แยกต่อลูก</p>", unsafe_allow_html=True)
+st.markdown("<h1 style='text-align:center;'>🌿 วิเคราะห์มะขาม - หลายผลในภาพเดียว (v2)</h1>", unsafe_allow_html=True)
+st.markdown("<p style='text-align:center;color:#a1887f;'>ปรับพารามิเตอร์ให้เหมาะสม → AI แยกผล → วิเคราะห์แยกต่อผล</p>", unsafe_allow_html=True)
 
-tab1, tab2, tab3 = st.tabs(["📸 ถ่าย/อัปโหลด", "🔍 แยกลูก & วิเคราะห์", "📊 สรุปผล"])
+tab1, tab2, tab3, tab4 = st.tabs(["📸 ถ่าย/อัปโหลด", "⚙️ ตั้งค่าการตรวจจับ", "🔍 แยกผล & วิเคราะห์", "📊 สรุปผล"])
 
 # ==================== TAB 1: CAPTURE ====================
 with tab1:
@@ -271,44 +368,110 @@ with tab1:
         st.session_state["source_image"] = img_array
         st.image(img_source, caption="ภาพต้นฉบับ", use_container_width=True)
 
-        st.markdown("#### ⚙️ ตั้งค่าการตรวจจับ")
-        c1, c2 = st.columns(2)
-        with c1:
-            min_area = st.slider("พื้นที่ต่ำสุด (pixels)", 100, 5000, 800, 100, key="min_area")
-        with c2:
-            max_area = st.slider("พื้นที่สูงสุด (pixels)", 5000, 100000, 50000, 1000, key="max_area")
+        st.success("✅ ภาพพร้อม! ไปที่แท็บ '⚙️ ตั้งค่าการตรวจจับ' เพื่อปรับพารามิเตอร์และตรวจจับ")
+
+# ==================== TAB 2: DETECTION SETTINGS ====================
+with tab2:
+    st.markdown("### ⚙️ ตั้งค่าการตรวจจับมะขาม")
+    st.info("💡 ปรับค่าต่างๆ ให้เหมาะกับสภาพภาพ แล้วกด 'ตรวจจับ' ดูผลลัพธ์ ถ้ายังไม่ดีให้กลับมาปรับใหม่")
+
+    if "source_image" not in st.session_state:
+        st.warning("กรุณาถ่าย/อัปโหลดภาพในแท็บแรกก่อน")
+    else:
+        img_array = st.session_state["source_image"]
+
+        p = st.session_state.detection_params
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            st.markdown("**🎨 สี (HSV)**")
+            h_low = st.slider("Hue ต่ำสุด", 0, 180, p["hsv_h_low"], key="h_low")
+            h_high = st.slider("Hue สูงสุด", 0, 180, p["hsv_h_high"], key="h_high")
+            s_low = st.slider("Saturation ต่ำสุด", 0, 255, p["hsv_s_low"], key="s_low")
+            s_high = st.slider("Saturation สูงสุด", 0, 255, p["hsv_s_high"], key="s_high")
+            v_low = st.slider("Value ต่ำสุด", 0, 255, p["hsv_v_low"], key="v_low")
+            v_high = st.slider("Value สูงสุด", 0, 255, p["hsv_v_high"], key="v_high")
+
+        with col2:
+            st.markdown("**🔧 Morphology**")
+            morph_close = st.slider("Closing Kernel", 3, 50, p["morph_close"], 1, key="morph_close")
+
+            st.markdown("**📐 ขนาด**")
+            min_area = st.slider("พื้นที่ต่ำสุด (px)", 50, 5000, p["min_area"], 50, key="min_area")
+            max_area = st.slider("พื้นที่สูงสุด (px)", 5000, 150000, p["max_area"], 1000, key="max_area")
+
+            st.markdown("**📏 รูปทรง**")
+            min_ar = st.slider("Aspect Ratio ต่ำสุด", 0.1, 5.0, p["min_aspect"], 0.1, key="min_ar")
+            max_ar = st.slider("Aspect Ratio สูงสุด", 1.0, 50.0, p["max_aspect"], 1.0, key="max_ar")
+
+        with col3:
+            st.markdown("**✅ เกณฑ์คุณภาพ**")
+            min_sol = st.slider("Solidity ต่ำสุด", 0.0, 1.0, p["min_solidity"], 0.05, key="min_sol")
+            min_ext = st.slider("Extent ต่ำสุด", 0.0, 1.0, p["min_extent"], 0.05, key="min_ext")
+
+            st.markdown("**💡 คำแนะนำ**")
+            st.caption("กองมะขาม: Close=25-35, Min Area=200")
+            st.caption("พื้นขาว: Close=8-15, Min Area=100")
+            st.caption("บนต้น: Close=10-15, Min Area=80")
+
+        # Save params
+        current_params = {
+            "hsv_h_low": h_low, "hsv_h_high": h_high,
+            "hsv_s_low": s_low, "hsv_s_high": s_high,
+            "hsv_v_low": v_low, "hsv_v_high": v_high,
+            "morph_close": morph_close,
+            "min_area": min_area, "max_area": max_area,
+            "min_aspect": min_ar, "max_aspect": max_ar,
+            "min_solidity": min_sol, "min_extent": min_ext,
+        }
+        st.session_state.detection_params = current_params
+
+        st.markdown("---")
 
         if st.button("🔍 ตรวจจับมะขามในภาพ", key="detect_btn"):
             with st.spinner("กำลังวิเคราะห์ภาพ..."):
-                objects, mask = detect_tamarinds_in_image(img_array, min_area, max_area)
+                objects, final_mask, color_mask, rejected = detect_tamarinds_advanced(img_array, current_params)
                 st.session_state.detected_objects = objects
 
                 if len(objects) == 0:
-                    st.warning("ไม่พบมะขามในภาพ ลองปรับค่าพื้นที่ต่ำสุด/สูงสุด หรือถ่ายภาพใหม่")
+                    st.warning(f"ไม่พบมะขามที่ผ่านเกณฑ์ ลองปรับค่าให้ผ่อนปรนลง (Rejected: {len(rejected)})")
                 else:
-                    st.success(f"พบมะขาม {len(objects)} ลูกในภาพ!")
+                    st.success(f"พบมะขาม {len(objects)} ผลในภาพ!")
 
-                    # แสดงภาพพร้อมกรอบ
-                    boxed_img = draw_detection_boxes(img_array, objects)
-                    st.image(boxed_img, caption="ผลการตรวจจับ (เลข = ลำดับลูก)", use_container_width=True)
+                col_r1, col_r2, col_r3 = st.columns(3)
 
-                    # แสดง mask
-                    st.image(mask, caption="AI Mask (สีขาว = พื้นที่ที่ตรวจพบ)", use_container_width=True)
+                with col_r1:
+                    st.image(img_array, caption="ภาพต้นฉบับ", use_container_width=True)
 
-# ==================== TAB 2: ANALYZE EACH ====================
-with tab2:
+                with col_r2:
+                    st.image(color_mask, caption="Color Mask (สีขาว = พื้นที่สีมะขาม)", use_container_width=True)
+
+                with col_r3:
+                    boxed_img = draw_detection_advanced(img_array, objects)
+                    st.image(boxed_img, caption=f"ผลการตรวจจับ ({len(objects)} ผล)", use_container_width=True)
+
+                with st.expander("🔧 Debug Info (คลิกดูรายละเอียด)"):
+                    st.write(f"Rejected contours: {len(rejected)}")
+                    if rejected:
+                        st.text("\n".join(rejected[:50]))
+                    if len(rejected) > 50:
+                        st.text(f"... และอีก {len(rejected)-50} รายการ")
+
+# ==================== TAB 3: ANALYZE EACH ====================
+with tab3:
     if not st.session_state.detected_objects:
-        st.info("กรุณาถ่าย/อัปโหลดภาพและกด 'ตรวจจับมะขามในภาพ' ในแท็บแรกก่อน")
+        st.info("กรุณาถ่าย/อัปโหลดภาพและกด 'ตรวจจับมะขามในภาพ' ในแท็บที่ 2 ก่อน")
     else:
         objects = st.session_state.detected_objects
-        st.markdown(f"### พบ {len(objects)} ลูก วิเคราะห์แยกต่อลูกได้เลย")
+        st.markdown(f"### พบ {len(objects)} ผล วิเคราะห์แยกต่อผลได้เลย")
 
         for obj in objects:
-            with st.expander(f"🌿 ลูกที่ {obj['id']} | {obj['color_label']} | ประมาณ {obj['estimated_size']}cm"):
+            with st.expander(f"🌿 ผลที่ {obj['id']} | {obj['color_label']} | ประมาณ {obj['estimated_size']}cm"):
                 col_img, col_form = st.columns([1, 2])
 
                 with col_img:
-                    st.image(obj["roi"], caption=f"ลูกที่ {obj['id']}", use_container_width=True)
+                    st.image(obj["roi"], caption=f"ผลที่ {obj['id']}", use_container_width=True)
                     st.caption(f"พื้นที่: {obj['area']} px\nความสว่าง: {obj['avg_brightness']}%")
 
                 with col_form:
@@ -330,13 +493,13 @@ with tab2:
                                              format_func=lambda x: {"excellent": "สวย", "good": "ดี", "fair": "พอใช้", "poor": "ไม่ดี"}[x],
                                              key=f"shape_{obj['id']}")
 
-                    if st.button(f"➕ เพิ่มลูกที่ {obj['id']} เข้าชุด", key=f"add_{obj['id']}"):
+                    if st.button(f"➕ เพิ่มผลที่ {obj['id']} เข้าชุด", key=f"add_{obj['id']}"):
                         total, scores = calculate_grade(type_info, size, obj['color_score'], clean, moisture, pulp, taste, shape)
                         gr, label, gr_color = get_grade(total)
 
                         result = {
                             "ลำดับ": len(st.session_state.batch_results) + 1,
-                            "ลูกที่": obj['id'],
+                            "ผลที่": obj['id'],
                             "ชนิด": selected_type,
                             "ขนาด(cm)": size,
                             "ความชื้น(%)": moisture,
@@ -351,10 +514,10 @@ with tab2:
                             "ข้อเสนอแนะ": " | ".join(get_suggestions(scores))
                         }
                         st.session_state.batch_results.append(result)
-                        st.success(f"✅ เพิ่มลูกที่ {obj['id']} เกรด {gr} ({total}/100) แล้ว!")
+                        st.success(f"✅ เพิ่มผลที่ {obj['id']} เกรด {gr} ({total}/100) แล้ว!")
 
-# ==================== TAB 3: SUMMARY ====================
-with tab3:
+# ==================== TAB 4: SUMMARY ====================
+with tab4:
     if not st.session_state.batch_results:
         st.warning("ยังไม่มีข้อมูล")
     else:
@@ -365,7 +528,7 @@ with tab3:
         grade_counts = df["เกรด"].value_counts().to_dict()
 
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("จำนวนลูก", total_items)
+        m1.metric("จำนวนผล", total_items)
         m2.metric("คะแนนเฉลี่ย", f"{avg_score:.1f}")
         m3.metric("เกรด A", grade_counts.get("A", 0))
         m4.metric("เกรด D", grade_counts.get("D", 0))
@@ -374,7 +537,7 @@ with tab3:
         st.bar_chart(df["เกรด"].value_counts().sort_index())
 
         st.markdown("#### ตารางผลการวิเคราะห์")
-        display_df = df[["ลำดับ", "ลูกที่", "ชนิด", "ขนาด(cm)", "ความชื้น(%)", "คะแนนรวม", "เกรด", "ราคา"]].copy()
+        display_df = df[["ลำดับ", "ผลที่", "ชนิด", "ขนาด(cm)", "ความชื้น(%)", "คะแนนรวม", "เกรด", "ราคา"]].copy()
 
         def color_grade(val):
             colors = {"A": "background-color: #4caf50; color: white;",
@@ -402,9 +565,4 @@ with tab3:
         st.dataframe(type_summary, use_container_width=True)
 
 st.markdown("---")
-st.caption("อ้างอิง: มาตรฐานสินค้าเกษตรมะขามหวาน (ราชกิจจานุเบกษา)")
-
-        st.dataframe(type_summary, use_container_width=True)
-
-st.markdown("---")
-st.caption("อ้างอิง: มาตรฐานสินค้าเกษตรมะขามหวาน (ราชกิจจานุเบกษา)")
+st.caption("อ้างอิง: มาตรฐานสินค้าเกษตรมะขามหวาน (ราชกิจจานุเบกษา) | Algorithm v2 - minAreaRect + Multi-criteria Filtering")

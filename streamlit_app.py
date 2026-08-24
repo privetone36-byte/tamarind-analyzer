@@ -403,3 +403,8 @@ with tab3:
 
 st.markdown("---")
 st.caption("อ้างอิง: มาตรฐานสินค้าเกษตรมะขามหวาน (ราชกิจจานุเบกษา)")
+
+        st.dataframe(type_summary, use_container_width=True)
+
+st.markdown("---")
+st.caption("อ้างอิง: มาตรฐานสินค้าเกษตรมะขามหวาน (ราชกิจจานุเบกษา)")
